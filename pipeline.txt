@@ -1,0 +1,167 @@
+//declaring common variables that will be used throughout the pipeline script
+def shellOutput = ""
+def dvwaContainerName = "dvwacontainer"
+def zapContainerName = "zapcontainer"
+def owaspZapNet = "owasp-zap-net"
+ 
+// a groovy function that stops and removes the DVWA container
+def stopAndRemoveDVWAContainer(dvwaContainerName) {
+	def shellOutput = sh(script: "docker ps -aqf \"name=${dvwaContainerName}\"",returnStdout: true).trim()
+ 
+	//note the double quotes to use variable substitution
+	echo "dvwa container id: ${shellOutput}"
+ 
+	if(shellOutput != ""){
+		sh "docker container stop $shellOutput"
+		sh "docker container rm $shellOutput"
+	} else {
+		echo "no container called ${dvwaContainerName}"				
+	}					
+}
+ 
+/*
+ Note that when we manually start up the DVWA web application, we had to initialize the web application by logging in and creating the database. 
+ This groovy function does that programmatically.
+*/
+def startAndInitializeDVWAContainer(dvwaContainerPortNumber) {
+ 
+	/*
+		we dump the headers and the html response into 2 files so that we can extract out the php session id
+		and also the user token
+	*/
+	sh "curl --dump-header headers.txt GET 'http://localhost:${dvwaContainerPortNumber}/setup.php' > htmlresponse.txt"
+ 
+	//getting php session id
+	shellOutput = sh(script: "cat headers.txt | grep \"PHPSESSID\"", returnStdout: true).trim()	
+	def phpSessionId = shellOutput.substring(shellOutput.indexOf("=")+1, shellOutput.indexOf(";"))
+	echo "phpSessionId:${phpSessionId}"
+ 
+ 
+	//getting user token
+	shellOutput = sh(script: "cat htmlresponse.txt | grep \"user_token\"", returnStdout: true).trim()	
+	def firstDelimiter = "value='"
+	def firstDelimiterIndex = shellOutput.indexOf(firstDelimiter)+firstDelimiter.length()
+	def userToken = shellOutput.substring(shellOutput.indexOf(firstDelimiter)+firstDelimiter.length(), shellOutput.indexOf("'", firstDelimiterIndex))
+	echo "userToken:${userToken}"
+ 
+	//once we get both the php session id and user token, we can create the database
+	shellOutput = sh(script: "curl --location --request POST 'http://localhost:${dvwaContainerPortNumber}/setup.php' "+
+	"--header 'Cookie: PHPSESSID=${phpSessionId}; security=low' " +
+	"--form 'user_token=${userToken}' " +
+	"--form 'create_db=Create+%2F+Reset+Database'",
+	returnStdout: true).trim()
+ 
+	if(shellOutput.indexOf("Database has been created") == -1)
+		error "Unable to create database for dvwa application"
+	else
+		echo "dvwa application initialized"
+}
+ 
+pipeline {
+    agent any
+    stages {
+        stage('Baseline Scan') {
+            steps {
+				//deleting all files in the current workspace so we start clean
+				cleanWs()
+ 
+				//we checkout ourt files from the github repository into the current workspace
+				checkout([$class: 'GitSCM', 
+					branches: [[name: "origin/master"]], 
+					userRemoteConfigs: [[
+					url: 'https://github.com/augmentonesecurity/dvwa_owasp_zap_config.git']],
+				])			
+ 
+				//we create the user defined network here.
+				sh "docker network create ${owaspZapNet}"
+ 
+                script{
+					//we start up the dvwa container
+					def dvwaContainerPortNumber = 8090
+					def dvwaContainer = docker.image('citizenstig/dvwa').run("-p ${dvwaContainerPortNumber}:80 --name ${dvwaContainerName} --network ${owaspZapNet}");
+ 
+					/*
+						we are waiting for 5 seconds before trying to check that the dvwa web application has been initialized and retrying 3 times.
+						if not, we fail the build
+					*/
+                    retry(3) {
+                        sleep 5
+						shellOutput = sh(script: "curl -v -L http://localhost:${dvwaContainerPortNumber}", returnStdout: true).trim()
+						if(!shellOutput.contains("<title>Login :: Damn Vulnerable Web Application (DVWA) v1.10 *Development*</title>"))
+							error "${dvwaContainerName} still not started"
+						else {
+							echo "${dvwaContainerName} has started"	
+							startAndInitializeDVWAContainer(dvwaContainerPortNumber)					
+						}
+                    }
+ 
+					//displaying the output to show that the dvwa container is registered in the user defined network
+					sh "docker network inspect ${owaspZapNet}"
+ 
+					/*
+						this is where we will be building our custom zap2docker-stable image with the arguments the user/group id of the jenkins user 
+						that is executing this build job
+					*/
+					def customImage = docker.build("modified-zap2docker-stable"," --build-arg USER_ID=\$(id -u jenkins) --build-arg GROUP_ID=\$(id -g jenkins) .")
+ 
+					def jenkinsWorkDir = env.WORKSPACE
+					/*
+						take note that when we spin up the container using this custom image, all commands in this block of code runs inside the container.
+						So when the block of code exits, the container will be stoppped and removed.
+						We are also mounting the current workspace to /zap/wrk here where we can transfer files between the container and workspace with ease
+					*/
+					customImage.inside("-p 8100:8080 --name=${zapContainerName} -v ${jenkinsWorkDir}:/zap/wrk/:rw -w /zap/wrk/  --network ${owaspZapNet}"){
+						try{
+							// overwriting the files in zap container with ours
+							sh "cp /zap/wrk/log4j.properties /zap/xml/"
+							sh "cp /zap/wrk/zap-baseline.py /zap/"
+							sh "cp /zap/wrk/zap_common.py /zap/"
+							sh "cp /zap/wrk/config.xml /zap/xml/"
+ 
+							//check to see if we are not able to reach the dvwa container through the docker user defined network
+							def shellReturnStatus = sh(script: "ping -c 2 ${dvwaContainerName}", returnStatus: true)
+							if(shellReturnStatus != 0) 
+								error('Not able to reach dvwa container')
+ 
+							def dvwaContainerUrl = "http://${dvwaContainerName}/"											
+							//checking that we can reach the dvwa web application through the docker user defined network
+							shellReturnStatus = sh(script: "curl -v -L ${dvwaContainerUrl}"	, returnStatus: true)
+							if(shellReturnStatus != 0)
+								error('Not able to reach dvwa web application')
+ 
+							//once all is good, we run the zap-baseline.py script
+							def zapBaselineCommand = "zap-baseline.py -t ${dvwaContainerUrl} -g gen.conf -r testreport.html -n /zap/wrk/Default_Context.context"							
+							sh "${zapBaselineCommand}"
+ 
+							//if you get to this point, your baseline scan passed
+							echo "Baseline scan passed"
+ 
+						} catch (Exception e) {
+							//when any errors happened we want to catch it and fail the build
+							echo "Exception happened: ${e.getMessage()}"
+							currentBuild.result = 'FAILURE'
+						} finally {
+							//copy the zap.log to /zap/wrk so that it will be in workspace for you to download and view it
+							sh "cp /home/zap/.ZAP/zap.log /zap/wrk"
+ 
+							//or alternatively, you can display the log in the jenkins build job console output
+							//sh "cat /home/zap/.ZAP/zap.log"
+						}						
+					}
+				}
+            }
+        }
+    }
+ 
+	post { 
+        always { 
+			script{
+				//cleaning up the build by stopping and removing the dvwa docker containers and network
+				stopAndRemoveDVWAContainer(dvwaContainerName)
+				echo "removing network ${owaspZapNet}"
+				sh "docker network rm ${owaspZapNet}"
+			}
+        }
+    }
+ 
+}
